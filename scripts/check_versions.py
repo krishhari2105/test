@@ -1,11 +1,9 @@
 import os
 import requests
-import re
 import subprocess
-import json
 import sys
 
-# --- Configuration for Patch Sources ---
+# --- Configuration ---
 SOURCES = {
     "revanced": {
         "patches_repo": "ReVanced/revanced-patches",
@@ -15,7 +13,7 @@ SOURCES = {
     },
     "inotia00": {
         "patches_repo": "inotia00/revanced-patches",
-        "cli_repo": "inotia00/revanced-cli", 
+        "cli_repo": "inotia00/revanced-cli",
         "patches_asset": ".rvp",
         "cli_asset": ".jar"
     },
@@ -67,77 +65,77 @@ def download_asset(repo, extension, output_dir):
 def check_versions():
     os.makedirs("tools_check", exist_ok=True)
     
-    print(f"{'Source':<15} | {'App Package':<40} | {'Recommended Version'}")
-    print("-" * 80)
+    print(f"{'Source':<12} | {'App Package':<40} | {'Recommended Version'}")
+    print("-" * 85)
 
     for source_name, config in SOURCES.items():
         cli_path = download_asset(config["cli_repo"], config["cli_asset"], "tools_check")
         patches_path = download_asset(config["patches_repo"], config["patches_asset"], "tools_check")
 
         if not cli_path or not patches_path:
-            print(f"{source_name:<15} | ERROR: Could not download tools")
+            print(f"{source_name:<12} | ERROR: Could not download tools")
             continue
 
         try:
-            # We use 'list-versions' which outputs strict lists of versions per app
+            # Run list-versions
             cmd = ["java", "-jar", cli_path, "list-versions", patches_path]
-            output = subprocess.check_output(cmd, text=True)
-        except Exception as e:
-            print(f"{source_name:<15} | CLI Error: {e}")
-            continue
-
-        # --- Strict Parsing Logic ---
-        # Format usually:
-        # com.package.name
-        #    18.01.32
-        #    18.01.33
-        #
-        # Logic: Line starting with NO spaces is a package. Line STARTING with spaces is a version.
-        
-        found_versions = {app: set() for app in APPS_TO_CHECK}
-        current_package = None
-
-        for line in output.splitlines():
-            if not line.strip(): continue
-
-            # Check indentation to determine hierarchy
-            if not line.startswith(" ") and not line.startswith("\t"):
-                # This is a Header (Package Name)
-                clean_line = line.strip()
-                # Only switch if it's exactly one of our target apps
-                # This prevents partial matches or logging noise
-                if clean_line in APPS_TO_CHECK:
-                    current_package = clean_line
-                else:
-                    current_package = None # Reset if we hit a package we don't care about
+            process = subprocess.run(cmd, capture_output=True, text=True)
             
-            elif current_package:
-                # This is an indented line under a target package
-                # It should be a version number
-                clean_v = line.strip()
-                
-                # Strict Version Regex: digits.digits.digits (optional v prefix)
-                # This ignores "Compatible with..." text
-                if re.match(r'^v?\d+(\.\d+)+$', clean_v):
-                    found_versions[current_package].add(clean_v)
+            if process.returncode != 0:
+                print(f"{source_name:<12} | CLI Error (Code {process.returncode})")
+                print(process.stderr)
+                continue
 
-        # Print Results
-        for app in APPS_TO_CHECK:
-            versions = found_versions[app]
-            if versions:
-                # Sort versions numeric descending
-                def version_sort_key(v):
-                    try:
-                        # Remove 'v' if present
-                        clean = v.lstrip('v')
-                        return [int(part) for part in clean.split('.')]
-                    except:
-                        return [0]
+            output = process.stdout
+            
+            # --- Strict Parsing Logic ---
+            found_versions = {}
+            current_pkg = None
+
+            for line in output.splitlines():
+                if not line.strip(): continue
+
+                # Package lines usually start with NO whitespace
+                if not line.startswith(" ") and not line.startswith("\t"):
+                    current_pkg = line.strip()
+                    continue
                 
-                sorted_vs = sorted(list(versions), key=version_sort_key, reverse=True)
-                print(f"{source_name:<15} | {app:<40} | {sorted_vs[0]}")
-            else:
-                print(f"{source_name:<15} | {app:<40} | Any/Universal (or check failed)")
+                # Version lines are indented
+                if current_pkg and (line.startswith(" ") or line.startswith("\t")):
+                    v = line.strip()
+                    # Filter out non-version strings (sometimes output has other info)
+                    # We assume a version contains at least one dot and starts with a digit or 'v'
+                    if "." in v and (v[0].isdigit() or v.startswith('v')):
+                         if current_pkg not in found_versions:
+                             found_versions[current_pkg] = []
+                         found_versions[current_pkg].append(v)
+
+            # --- Display Results ---
+            for app in APPS_TO_CHECK:
+                if app in found_versions:
+                    # Sort versions desc (assuming standard semantic versioning)
+                    vs = found_versions[app]
+                    # Cleanup 'v' for sorting
+                    def sort_key(s):
+                        try:
+                            return [int(x) for x in s.lstrip('v').split('.')]
+                        except:
+                            return [0]
+                    
+                    vs.sort(key=sort_key, reverse=True)
+                    latest = vs[0]
+                    print(f"{source_name:<12} | {app:<40} | {latest}")
+                else:
+                    print(f"{source_name:<12} | {app:<40} | None (Not in patches)")
+            
+            # Debug dump if YouTube wasn't found (implies parsing failure or format change)
+            if "com.google.android.youtube" not in found_versions:
+                print(f"\n[DEBUG] Raw Output for {source_name} (First 20 lines):")
+                print("\n".join(output.splitlines()[:20]))
+                print("-" * 20 + "\n")
+
+        except Exception as e:
+            print(f"{source_name:<12} | Exception: {e}")
 
 if __name__ == "__main__":
     check_versions()
