@@ -79,70 +79,65 @@ def check_versions():
             continue
 
         try:
-            # Command changed to 'list-versions' as requested
-            cmd = ["java", "-jar", cli_path, "list-versions", "-f", patches_path] 
-            # -f flag sometimes needed for formatting, or just patches.rvp
-            # We'll try bare command first: list-versions patches.rvp
+            # We use 'list-versions' which outputs strict lists of versions per app
             cmd = ["java", "-jar", cli_path, "list-versions", patches_path]
-            
             output = subprocess.check_output(cmd, text=True)
         except Exception as e:
-            # Fallback if list-versions fails (older CLIs might not have it)
-            try:
-                cmd = ["java", "-jar", cli_path, "list-patches", "--with-versions", patches_path]
-                output = subprocess.check_output(cmd, text=True)
-            except Exception as e2:
-                print(f"{source_name:<15} | CLI Error: {e2}")
-                continue
+            print(f"{source_name:<15} | CLI Error: {e}")
+            continue
 
-        # --- Parsing Logic ---
-        # We need to map Package -> Versions
-        # The output format often groups versions under packages.
+        # --- Strict Parsing Logic ---
+        # Format usually:
+        # com.package.name
+        #    18.01.32
+        #    18.01.33
+        #
+        # Logic: Line starting with NO spaces is a package. Line STARTING with spaces is a version.
         
         found_versions = {app: set() for app in APPS_TO_CHECK}
         current_package = None
 
         for line in output.splitlines():
-            line = line.strip()
-            if not line: continue
+            if not line.strip(): continue
 
-            # check if this line is a package name we care about
-            is_package_line = False
-            for app in APPS_TO_CHECK:
-                if app in line:
-                    current_package = app
-                    is_package_line = True
-                    break
+            # Check indentation to determine hierarchy
+            if not line.startswith(" ") and not line.startswith("\t"):
+                # This is a Header (Package Name)
+                clean_line = line.strip()
+                # Only switch if it's exactly one of our target apps
+                # This prevents partial matches or logging noise
+                if clean_line in APPS_TO_CHECK:
+                    current_package = clean_line
+                else:
+                    current_package = None # Reset if we hit a package we don't care about
             
-            if is_package_line:
-                continue
-
-            # If we are under a package, look for versions
-            if current_package:
-                # Regex for version: 19.16.39 or v19.16.39
-                # We strip common non-version chars
-                v_match = re.search(r'\b(\d+\.\d+\.\d+)\b', line)
-                if v_match:
-                    found_versions[current_package].add(v_match.group(1))
+            elif current_package:
+                # This is an indented line under a target package
+                # It should be a version number
+                clean_v = line.strip()
                 
-                # Stop if we hit a line that looks like a different package or header (heuristic)
-                # But 'list-versions' usually strictly lists them. 
+                # Strict Version Regex: digits.digits.digits (optional v prefix)
+                # This ignores "Compatible with..." text
+                if re.match(r'^v?\d+(\.\d+)+$', clean_v):
+                    found_versions[current_package].add(clean_v)
 
         # Print Results
         for app in APPS_TO_CHECK:
             versions = found_versions[app]
             if versions:
-                # Sort versions
+                # Sort versions numeric descending
                 def version_sort_key(v):
                     try:
-                        return [int(part) for part in v.split('.')]
+                        # Remove 'v' if present
+                        clean = v.lstrip('v')
+                        return [int(part) for part in clean.split('.')]
                     except:
                         return [0]
                 
                 sorted_vs = sorted(list(versions), key=version_sort_key, reverse=True)
                 print(f"{source_name:<15} | {app:<40} | {sorted_vs[0]}")
             else:
-                print(f"{source_name:<15} | {app:<40} | Any/Universal")
+                print(f"{source_name:<15} | {app:<40} | Any/Universal (or check failed)")
 
 if __name__ == "__main__":
     check_versions()
