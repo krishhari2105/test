@@ -38,7 +38,6 @@ SOURCES = {
     }
 }
 
-# Supported apps
 PKG_MAP = {
     "youtube": "com.google.android.youtube",
     "yt-music": "com.google.android.apps.youtube.music",
@@ -52,7 +51,6 @@ def log(msg):
 
 def error(msg):
     print(f"[!] {msg}", flush=True)
-    # Don't exit immediately if processing multiple apps, just raise exception
     raise Exception(msg)
 
 def download_file(url, filename):
@@ -152,8 +150,54 @@ def get_target_version(cli_path, patches_path, package_name, manual_version):
         
     raise Exception(f"Could not determine version automatically for {package_name}")
 
+def strip_monolithic_apk(apk_path):
+    """
+    Removes non-arm64 libraries from a monolithic APK to reduce size.
+    """
+    log(f"Inspecting monolithic APK: {apk_path}")
+    
+    # Check if it contains multiple architectures
+    has_arm64 = False
+    has_others = False
+    
+    try:
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            for name in z.namelist():
+                if "lib/arm64-v8a" in name:
+                    has_arm64 = True
+                elif "lib/x86" in name or "lib/armeabi-v7a" in name:
+                    has_others = True
+    except:
+        return apk_path # Invalid zip, let patcher fail later
+
+    if not has_arm64:
+        log("No arm64-v8a libs found or purely Java/Kotlin app. Skipping strip.")
+        return apk_path
+        
+    if not has_others:
+        log("APK is already arm64-only. Skipping strip.")
+        return apk_path
+
+    log("Stripping non-arm64 architectures...")
+    stripped_path = apk_path.replace(".apk", "_arm64.apk")
+    
+    with zipfile.ZipFile(apk_path, 'r') as zin:
+        with zipfile.ZipFile(stripped_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                name = item.filename
+                # Filter: Keep if NOT lib OR (is lib AND is arm64)
+                if not name.startswith("lib/") or "lib/arm64-v8a/" in name:
+                    buffer = zin.read(name)
+                    zout.writestr(item, buffer)
+                    
+    log(f"Stripped APK created: {stripped_path}")
+    return stripped_path
+
 def merge_bundle(bundle_path, apkeditor_path):
-    log(f"Processing bundle: {bundle_path}")
+    """
+    Extracts bundle and merges ONLY arm64 splits using APKEditor.
+    """
+    log(f"Processing bundle for arm64 extraction: {bundle_path}")
     extract_dir = f"extracted_{os.path.basename(bundle_path)}"
     if os.path.exists(extract_dir):
         shutil.rmtree(extract_dir)
@@ -165,11 +209,25 @@ def merge_bundle(bundle_path, apkeditor_path):
     except zipfile.BadZipFile:
         raise Exception("Downloaded file is not a valid zip/apkm file.")
 
-    output_merged = bundle_path.replace(".apkm", ".apk").replace(".apks", ".apk").replace(".xapk", ".apk")
+    # Filter splits inside extracted directory
+    # We delete anything that is architecture specific BUT NOT arm64
+    # Common names: split_config.arm64_v8a.apk, split_config.armeabi_v7a.apk
+    
+    for root, dirs, files in os.walk(extract_dir):
+        for f in files:
+            if not f.endswith(".apk"): continue
+            
+            # Logic: If it specifies an arch, it MUST be arm64
+            if "x86" in f or "armeabi" in f or "mips" in f:
+                if "arm64" not in f:
+                    log(f"Removing unwanted split: {f}")
+                    os.remove(os.path.join(root, f))
+    
+    output_merged = bundle_path.replace(".apkm", "_arm64.apk").replace(".apks", "_arm64.apk").replace(".xapk", "_arm64.apk")
     if output_merged == bundle_path:
-        output_merged = bundle_path + "_merged.apk"
+        output_merged = bundle_path + "_merged_arm64.apk"
 
-    log(f"Merging splits into: {output_merged}")
+    log(f"Merging filtered splits into: {output_merged}")
     
     cmd = [
         "java", "-jar", apkeditor_path,
@@ -192,6 +250,7 @@ def find_apk_in_release(app_name, version):
     target_base = f"{app_name}-v{version}"
     for asset in release.get('assets', []):
         name = asset['name']
+        # Strict match on start
         if name.startswith(target_base) and name.endswith(('.apk', '.apkm', '.apks', '.xapk')):
             return asset['browser_download_url'], name
     return None, None
@@ -216,16 +275,20 @@ def patch_app(app_key, patch_source, version_override, cli_path, patches_path):
         if not download_file(dl_url, local_apk):
              raise Exception("Download failed")
 
-        # Bundle check
+        # Process Input (Bundle Merge OR Monolithic Strip)
         final_apk_path = local_apk
+        
         if local_apk.endswith((".apkm", ".apks", ".xapk")):
             apkeditor_path = fetch_apkeditor()
             final_apk_path = merge_bundle(local_apk, apkeditor_path)
+        else:
+            # It's a standard APK, try to strip it
+            final_apk_path = strip_monolithic_apk(local_apk)
 
         # Patch
         dist_dir = "dist"
         os.makedirs(dist_dir, exist_ok=True)
-        out_apk = f"{dist_dir}/{app_key}-{patch_source}-v{version}.apk"
+        out_apk = f"{dist_dir}/{app_key}-{patch_source}-v{version}-arm64.apk"
         
         cmd = [
             "java", "-jar", cli_path,
@@ -246,14 +309,13 @@ def patch_app(app_key, patch_source, version_override, cli_path, patches_path):
 
 def main():
     patch_source = os.environ.get("PATCH_SOURCE")
-    apps_input = os.environ.get("APPS_LIST", "all") # comma separated or "all"
+    apps_input = os.environ.get("APPS_LIST", "all")
     manual_version = os.environ.get("VERSION", "auto")
 
     if not patch_source: 
         print("[!] PATCH_SOURCE env var missing")
         sys.exit(1)
 
-    # Determine apps list
     if apps_input.lower() == "all":
         apps_to_process = list(PKG_MAP.keys())
     else:
@@ -261,7 +323,6 @@ def main():
 
     log(f"Batch Processing: {apps_to_process} using {patch_source}")
 
-    # Fetch tools ONCE
     try:
         cli_path, patches_path = fetch_tools(patch_source)
     except Exception as e:
@@ -278,7 +339,6 @@ def main():
     print("\n" + "="*40)
     log(f"Batch completed. Successful builds: {success_count}/{len(apps_to_process)}")
     
-    # Generate Env Vars for Release Step
     date_str = datetime.now().strftime("%Y.%m.%d")
     tag_name = f"v{date_str}-{patch_source}"
     with open(os.environ['GITHUB_ENV'], 'a') as f:
