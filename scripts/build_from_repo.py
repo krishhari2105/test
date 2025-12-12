@@ -63,12 +63,38 @@ def download_file(url, filename):
     log(f"Downloading {url} -> {filename}")
     try:
         headers = get_auth_headers()
-        with requests.get(url, stream=True, headers=headers) as r:
-            if r.status_code == 404: return False
-            r.raise_for_status()
-            with open(filename, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
+        # Essential for downloading binary files from the API
+        headers["Accept"] = "application/octet-stream"
+        
+        # 1. Start the request but DO NOT follow redirects immediately
+        with requests.get(url, headers=headers, stream=True, allow_redirects=False) as r:
+            if r.status_code == 404: 
+                log(f"Error: 404 Not Found for {url}")
+                return False
+            
+            # 2. Handle Redirects Manually
+            # If we get a 302/301, we must download from the NEW location
+            # BUT we must drop the 'Authorization' header for the new location (S3)
+            final_url = url
+            if r.status_code in (301, 302, 307, 308):
+                final_url = r.headers['Location']
+                # Remove auth header for the S3 link
+                if "Authorization" in headers:
+                    del headers["Authorization"]
+                
+                # Make the second request to the actual file location
+                with requests.get(final_url, headers=headers, stream=True) as r2:
+                    r2.raise_for_status()
+                    with open(filename, 'wb') as f:
+                        for chunk in r2.iter_content(chunk_size=8192):
+                            f.write(chunk)
+            else:
+                # If no redirect, just write the content (unlikely for assets, but safe fallback)
+                r.raise_for_status()
+                with open(filename, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        
         return True
     except Exception as e:
         log(f"Download failed: {e}")
@@ -276,7 +302,7 @@ def find_apk_in_release(app_name, version):
         # Strict prefix check to avoid matching 19.16.391 etc if that ever happens
         if name.startswith(target_base) and name.endswith(('.apk', '.apkm', '.apks', '.xapk')):
             # Ensure precise version matching if needed, but prefix is usually safe
-            return asset['browser_download_url'], name
+            return asset['url'], name
     return None, None
 
 def patch_app(app_key, patch_source, input_version_string, cli_path, patches_path):
