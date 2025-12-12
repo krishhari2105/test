@@ -1,35 +1,41 @@
-name: ReVanced Auto Build
+name: Build ReVanced App
 
 on:
   workflow_dispatch:
     inputs:
-      force_version:
-        description: "Manually specify version (e.g. 19.04.37). Leave empty for auto."
+      app_name:
+        description: "App to patch (repo filename prefix)"
+        required: true
+        default: "youtube"
+        type: choice
+        options:
+          - youtube
+          - yt-music
+          - reddit
+          - twitter
+          - spotify
+      patch_source:
+        description: "Patch Source"
+        required: true
+        default: "revanced"
+        type: choice
+        options:
+          - revanced
+          - inotia00
+          - anddea
+      version:
+        description: "Version Override (Leave 'auto' to detect)"
         required: false
-        default: ""
-  schedule:
-    # Run every Sunday at midnight
-    - cron: '0 0 * * 0'
+        default: "auto"
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        app:
-          - name: "YouTube"
-            package: "com.google.android.youtube"
-          - name: "YouTube Music"
-            package: "com.google.android.apps.youtube.music"
-          # Add more apps here (Reddit, TikTok, etc.)
-          # - name: "Reddit"
-          #   package: "com.reddit.frontpage"
-
+      
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Java
@@ -44,32 +50,30 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: |
-          pip install -r scripts/requirements.txt
+        run: pip install requests
 
-      - name: Run Build Script
+      - name: Run Builder
         env:
-          APP_NAME: ${{ matrix.app.name }}
-          PACKAGE_NAME: ${{ matrix.app.package }}
-          VERSION: ${{ inputs.force_version || 'auto' }}
+          APP_NAME: ${{ inputs.app_name }}
+          PATCH_SOURCE: ${{ inputs.patch_source }}
+          VERSION: ${{ inputs.version }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python scripts/build_logic.py
+        run: python scripts/build_from_repo.py
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.app.name }}-ReVanced
+          name: ${{ inputs.app_name }}-${{ inputs.patch_source }}-v${{ env.APP_VERSION }}
           path: build/*.apk
 
-      - name: Create Release
+      - name: Release
         uses: softprops/action-gh-release@v2
-        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         with:
-          tag_name: v${{ env.APP_VERSION }}-${{ matrix.app.name }}
-          name: ${{ matrix.app.name }} ReVanced v${{ env.APP_VERSION }}
+          tag_name: v${{ env.APP_VERSION }}-${{ inputs.app_name }}-${{ inputs.patch_source }}
           files: ${{ env.PATCHED_APK }}
-          draft: false
-          prerelease: false
+          body: |
+            App: ${{ inputs.app_name }}
+            Version: ${{ env.APP_VERSION }}
+            Source: ${{ inputs.patch_source }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
