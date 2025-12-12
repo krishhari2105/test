@@ -1,0 +1,75 @@
+name: ReVanced Auto Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: "Manually specify version (e.g. 19.04.37). Leave empty for auto."
+        required: false
+        default: ""
+  schedule:
+    # Run every Sunday at midnight
+    - cron: '0 0 * * 0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - name: "YouTube"
+            package: "com.google.android.youtube"
+          - name: "YouTube Music"
+            package: "com.google.android.apps.youtube.music"
+          # Add more apps here (Reddit, TikTok, etc.)
+          # - name: "Reddit"
+          #   package: "com.reddit.frontpage"
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r scripts/requirements.txt
+
+      - name: Run Build Script
+        env:
+          APP_NAME: ${{ matrix.app.name }}
+          PACKAGE_NAME: ${{ matrix.app.package }}
+          VERSION: ${{ inputs.force_version || 'auto' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/build_logic.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.app.name }}-ReVanced
+          path: build/*.apk
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+        with:
+          tag_name: v${{ env.APP_VERSION }}-${{ matrix.app.name }}
+          name: ${{ matrix.app.name }} ReVanced v${{ env.APP_VERSION }}
+          files: ${{ env.PATCHED_APK }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
