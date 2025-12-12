@@ -73,15 +73,15 @@ def download_asset(repo, extension, output_dir):
 def check_versions():
     os.makedirs("tools_check", exist_ok=True)
     
-    print(f"{'Source':<12} | {'App Package':<40} | {'Recommended Version'}")
-    print("-" * 85)
+    print(f"{'Source':<18} | {'App Package':<40} | {'Compatible Versions'}")
+    print("-" * 120)
 
     for source_name, config in SOURCES.items():
         cli_path = download_asset(config["cli_repo"], config["cli_asset"], "tools_check")
         patches_path = download_asset(config["patches_repo"], config["patches_asset"], "tools_check")
 
         if not cli_path or not patches_path:
-            print(f"{source_name:<12} | ERROR: Could not download tools")
+            print(f"{source_name:<18} | ERROR: Could not download tools")
             continue
 
         try:
@@ -100,7 +100,6 @@ def check_versions():
                 if not line: continue
 
                 # Match "Package name: com.package.name" ignoring prefix like "INFO: "
-                # This fixes the issue where the first line wasn't detected
                 pkg_match = re.search(r"Package name:\s*([a-zA-Z0-9_.]+)", line)
                 if pkg_match:
                     current_pkg = pkg_match.group(1)
@@ -118,18 +117,20 @@ def check_versions():
                         v = v_match.group(1)
                         if current_pkg not in found_versions:
                             found_versions[current_pkg] = []
-                        found_versions[current_pkg].append(v)
+                        if v not in found_versions[current_pkg]:
+                            found_versions[current_pkg].append(v)
                     elif "Any" in line:
                          if current_pkg not in found_versions:
                              found_versions[current_pkg] = []
-                         found_versions[current_pkg].append("Any")
+                         if "Any" not in found_versions[current_pkg]:
+                             found_versions[current_pkg].append("Any")
 
             # --- Display Results ---
             for app in APPS_TO_CHECK:
                 if app in found_versions and found_versions[app]:
                     vs = found_versions[app]
                     if "Any" in vs:
-                         print(f"{source_name:<12} | {app:<40} | Any")
+                         print(f"{source_name:<18} | {app:<40} | Any")
                     else:
                         # Sort versions desc
                         def sort_key(s):
@@ -139,13 +140,14 @@ def check_versions():
                                 return [0]
                         
                         vs.sort(key=sort_key, reverse=True)
-                        latest = vs[0]
-                        print(f"{source_name:<12} | {app:<40} | {latest}")
+                        # Join all versions with comma
+                        all_versions_str = ", ".join(vs)
+                        print(f"{source_name:<18} | {app:<40} | {all_versions_str}")
                 else:
-                    print(f"{source_name:<12} | {app:<40} | None (Not in patches)")
+                    print(f"{source_name:<18} | {app:<40} | None (Not in patches)")
 
         except Exception as e:
-            print(f"{source_name:<12} | Exception: {e}")
+            print(f"{source_name:<18} | Exception: {e}")
 
 if __name__ == "__main__":
     check_versions()
