@@ -10,11 +10,12 @@ import time
 from bs4 import BeautifulSoup
 
 # --- Configuration ---
+# Headers to mimic a browser
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://google.com"
+    "Upgrade-Insecure-Requests": "1"
 }
 
 def log(msg):
@@ -29,7 +30,6 @@ def download_file(url, filename):
     try:
         with requests.get(url, stream=True, headers=HEADERS) as r:
             r.raise_for_status()
-            total_size = int(r.headers.get('content-length', 0))
             with open(filename, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     f.write(chunk)
@@ -72,6 +72,7 @@ def get_compatible_version(package_name, cli_path, patches_rvp_path, manual_vers
 
     log(f"Finding compatible version for {package_name} using CLI...")
     
+    # Check if we can get list of patches
     cmd = [
         "java", "-jar", cli_path, 
         "list-patches", 
@@ -85,244 +86,256 @@ def get_compatible_version(package_name, cli_path, patches_rvp_path, manual_vers
         error(f"Failed to list patches: {e}")
         return None
 
-    # Robust parsing strategy
     versions = set()
     
-    # Look for lines that contain the package name
-    # Format usually: "com.google.android.youtube (19.01.1, 19.02.2)"
-    # Or sometimes indented under a patch name
+    # Regex to find package name followed by versions in parentheses
+    # Adapting to potentially varying CLI output formats
+    # Typical format: "com.package.name (v1, v2)" or indented under a patch
     
+    # Escape dots in package name for regex
+    pkg_regex = re.escape(package_name)
+    
+    # Search line by line
     for line in result.splitlines():
         if package_name in line:
-            # Extract everything in parentheses
-            match = re.search(r'\(([\d\.,\s]+)\)', line)
-            if match:
-                v_str = match.group(1)
-                found_vs = [v.strip() for v in re.split(r'[,\s]+', v_str) if v.strip()]
-                # Basic validation: must look like a version number
-                valid_vs = [v for v in found_vs if re.match(r'^\d+(\.\d+)+$', v)]
-                versions.update(valid_vs)
+            # Look for version pattern inside parentheses
+            # Captures "18.01.32, 18.02.33" from "com.pkg (18.01.32, 18.02.33)"
+            # Also handles potential "v" prefix like "v18.01.32"
+            matches = re.findall(r'\(([\d\.,\s\w]+)\)', line)
+            for match in matches:
+                # Split by comma or space
+                raw_vs = re.split(r'[,\s]+', match)
+                for v in raw_vs:
+                    v = v.strip()
+                    # Basic semantic version check (digits and dots)
+                    if re.match(r'^\d+(\.\d+)+$', v):
+                        versions.add(v)
 
     if not versions:
-        log("No specific compatible versions found. This might be a 'Universal' patch set or parsing failed.")
-        log("Dumping first 20 lines of CLI output for debugging:")
-        print('\n'.join(result.splitlines()[:20]))
-        return None
+        log(f"No specific compatible versions found for {package_name} in CLI output.")
+        log("Possible reasons: Universal patches only, or parsing mismatch.")
+        log("Attempting to find 'Latest' version from APKMirror as fallback...")
+        return "latest"
 
-    # Sort versions
+    # Sort versions (numeric sort)
     def version_key(v):
-        return [int(x) for x in v.split('.')]
+        try:
+            return [int(x) for x in v.split('.')]
+        except:
+            return [0]
     
     sorted_versions = sorted(list(versions), key=version_key, reverse=True)
     best_version = sorted_versions[0]
     log(f"Latest compatible version found: {best_version}")
     return best_version
 
-# --- Advanced APKMirror Scraper ---
+# --- APKMirror Scraper (Sp3EdeR Logic) ---
 
 def get_soup(url):
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        if resp.status_code == 403:
+            log("Hit 403 on APKMirror. Waiting 5s...")
+            time.sleep(5)
+            resp = requests.get(url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
         return BeautifulSoup(resp.text, 'html.parser')
     except Exception as e:
-        log(f"Request failed: {url} | {e}")
+        log(f"Error fetching {url}: {e}")
         return None
 
-def scrape_apkmirror_full(app_name, version):
+def scrape_apkmirror(app_name, version):
     """
-    Full scraping logic for APKMirror:
-    1. Search -> 2. Release Page -> 3. Variant Page -> 4. Download Page -> 5. Link
+    Downloads APK from APKMirror.
+    Flow: Search -> Release Page -> Variant Page (Arm64) -> Download Page -> File
     """
-    log(f"Scraping APKMirror for {app_name} v{version}...")
+    base_url = "https://www.apkmirror.com"
     
     # 1. Search
-    # Formatting query to match APKMirror search URL structure
-    query = f"{app_name} {version}"
-    search_url = f"https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s={query.replace(' ', '+')}"
+    # If version is 'latest', we search just app name
+    query = f"{app_name} {version}" if version != "latest" else app_name
+    search_url = f"{base_url}/?post_type=app_release&searchtype=apk&s={query.replace(' ', '+')}"
     
+    log(f"Searching APKMirror: {search_url}")
     soup = get_soup(search_url)
     if not soup: return None
     
-    # Find the correct release row
-    # We look for a row where the text contains the version explicitly
-    res = soup.find_all("div", class_="appRow")
+    # Find release row
     release_url = None
+    rows = soup.find_all("div", class_="appRow")
     
-    for row in res:
-        title_tag = row.find("h5", class_="appRowTitle")
-        if title_tag:
-            title_text = title_tag.get_text().strip()
-            # Strict check: Version must be in title
-            if version in title_text:
-                link_tag = row.find("a", href=True)
-                if link_tag:
-                    release_url = "https://www.apkmirror.com" + link_tag['href']
-                    log(f"Found Release Page: {release_url}")
-                    break
-    
+    for row in rows:
+        title_div = row.find("h5", class_="appRowTitle")
+        if not title_div: continue
+        
+        title_text = title_div.get_text().strip()
+        link = title_div.find("a")['href']
+        
+        # If specific version, match it. If latest, take first result.
+        if version == "latest":
+            release_url = base_url + link
+            # Extract actual version from title if possible for logging
+            # (Assuming format "App Name Version")
+            log(f"Selected latest release: {title_text}")
+            # Update global version variable if needed? 
+            # Ideally we return the version found too, but for now we just download.
+            break
+        elif version in title_text:
+            release_url = base_url + link
+            log(f"Found release page: {release_url}")
+            break
+            
     if not release_url:
-        log("Release not found in search results.")
+        log("Release not found.")
         return None
-
-    # 2. Get Variant
-    # We prefer 'APK' over 'BUNDLE' if possible, but for split apps we might need bundle.
-    # ReVanced CLI handles split APKs if we extract them.
-    # We prefer 'arm64-v8a' architecture.
-    
-    time.sleep(1) # Be polite
+        
+    # 2. Select Variant
+    time.sleep(1)
     soup = get_soup(release_url)
     if not soup: return None
     
-    # Find variants table
-    # Styles: "table-row headerFont" -> Look for row containing "APK" or "Bundle"
+    # We need to find the variant table rows
+    # Columns usually: Variant, Arch, Min Android, DPI
     variants = soup.find_all("div", class_="table-row")
     
     target_variant_url = None
     
-    # Priority: APK > Bundle (if we can help it, but for YT Music usually bundle is fine if handled)
-    # Architecture: arm64-v8a > universal > noarch
+    # Scoring system for variants
+    # arm64-v8a > universal > noarch
+    # nodpi > specific dpi
+    # apk > bundle (if possible)
     
-    best_score = -1
+    best_score = -999
     
     for row in variants:
-        # Extract info
         cells = row.find_all("div", class_="table-cell")
-        if len(cells) < 2: continue
+        if len(cells) < 4: continue
         
-        variant_text = row.get_text().lower()
-        link = row.find("a", class_="accent_color")
-        if not link: continue
+        # Text extraction
+        variant_info = cells[0].get_text().strip().lower()
+        arch_info = cells[1].get_text().strip().lower()
+        dpi_info = cells[3].get_text().strip().lower()
         
-        url = "https://www.apkmirror.com" + link['href']
+        link_tag = cells[0].find("a", class_="accent_color")
+        if not link_tag: continue
+        url = base_url + link_tag['href']
         
         score = 0
-        if "arm64-v8a" in variant_text: score += 10
-        elif "universal" in variant_text: score += 5
-        elif "noarch" in variant_text: score += 5
-        elif "x86" in variant_text: score = -100 # Skip x86
         
-        if "apk" in cells[1].get_text().lower(): score += 2 
-        # Bundles are okay but standard APK is easier if available
+        # ARCHITECTURE (Critical)
+        if "arm64-v8a" in arch_info: 
+            score += 100
+        elif "universal" in arch_info:
+            score += 50
+        elif "noarch" in arch_info:
+            score += 50
+        elif "x86" in arch_info:
+            score = -1000 # Skip x86
+        else:
+            score = -100 # unknown/armeabi-v7a only
+            
+        # DPI
+        if "nodpi" in dpi_info:
+            score += 20
         
+        # TYPE
+        if "apk" in variant_info:
+            score += 10
+        elif "bundle" in variant_info:
+            score += 5
+            
         if score > best_score:
             best_score = score
             target_variant_url = url
-
-    if not target_variant_url:
-        log("No suitable variant found (arm64/universal).")
+            
+    if not target_variant_url or best_score < 0:
+        log("No suitable arm64 variant found.")
         return None
         
     log(f"Selected Variant: {target_variant_url}")
     
-    # 3. Download Page
+    # 3. Get Download Link
     time.sleep(1)
     soup = get_soup(target_variant_url)
     if not soup: return None
     
-    # Look for "Download APK" or "Download Bundle" button
-    # usually class="accent_bg btn btn-flat downloadButton"
-    download_btn = soup.find("a", class_="downloadButton")
-    if not download_btn:
-        # sometimes it says "Download APK Bundle"
-        download_btn = soup.select_one(".downloadButton")
-        
-    if not download_btn:
+    # Find "Download APK" button link
+    # Usually class="accent_bg btn btn-flat downloadButton"
+    btn = soup.select_one("a.downloadButton")
+    if not btn:
         log("Download button not found on variant page.")
         return None
         
-    final_page_url = "https://www.apkmirror.com" + download_btn['href']
-    log(f"Navigating to final download page: {final_page_url}")
+    download_page_url = base_url + btn['href']
+    log(f"Download Page: {download_page_url}")
     
-    # 4. Final Link
+    # 4. Final Click
     time.sleep(1)
-    soup = get_soup(final_page_url)
+    soup = get_soup(download_page_url)
     if not soup: return None
     
-    # Looking for: <a rel="nofollow" href="...">here</a>
-    # usually inside a p class="notes" or just a direct link saying "here"
-    
-    direct_link = None
-    here_link = soup.find("a", string=re.compile(r"here", re.I))
+    # Find "here" link
+    # <p class="notes"> ... <a rel="nofollow" href="...">here</a> ... </p>
+    here_link = soup.find("a", string=re.compile("here", re.I))
+    final_url = None
     
     if here_link:
-        direct_link = "https://www.apkmirror.com" + here_link['href']
+        final_url = base_url + here_link['href']
     else:
-        # Fallback: finding the click tracking link
-        # often /wp-content/themes/apk-mirror/download.php?id=...
-        log("Could not find 'here' link. Trying alternate selector.")
-        # Sometimes Cloudflare protects this specific part heavily.
+        # Fallback: look for /wp-content/themes/apk-mirror/download.php
+        fallback_link = soup.find("a", href=re.compile(r"download\.php\?id="))
+        if fallback_link:
+            final_url = base_url + fallback_link['href']
+            
+    if not final_url:
+        log("Final download link not found.")
         return None
-
-    if direct_link:
-        log(f"Direct Link Found: {direct_link}")
-        filename = f"downloads/{app_name.replace(' ','')}-{version}.apk" # defaulting extension, zip check later
-        download_file(direct_link, filename)
-        return filename
         
-    return None
+    # Download
+    filename = f"downloads/{app_name.replace(' ', '')}-{version}.apk"
+    download_file(final_url, filename)
+    return filename
 
-# --- Main Logic ---
+# --- Split APK Handling ---
 
 def process_apk(apk_path):
     """
-    Handles Bundles (.apkm, .xapk, .zip) or Split APKs.
-    Extracts and returns list of files to pass to patcher.
+    Handles Bundles (.apkm, .xapk, .zip).
+    Extracts base.apk and config.arm64_v8a.apk
     """
-    if not apk_path or not os.path.exists(apk_path):
-        error("APK path invalid")
-
-    # Check if it's actually a zip/bundle despite .apk extension
-    is_zip = False
-    try:
-        if zipfile.is_zipfile(apk_path):
-            # It might be a regular APK (which is a zip) or a Bundle (zip of apks)
-            # We check contents to distinguish
-            with zipfile.ZipFile(apk_path, 'r') as z:
-                contents = z.namelist()
-                # If it contains .apk files inside, it's a bundle
-                if any(f.endswith('.apk') for f in contents):
-                    is_zip = True
-    except:
-        pass
-
-    if not is_zip:
+    if not zipfile.is_zipfile(apk_path):
         return [apk_path]
-    
-    log("Detected Bundle/Split-APK. Extracting...")
+        
+    log("Bundle detected. Extracting...")
     extract_dir = "extracted_apk"
     if os.path.exists(extract_dir):
         shutil.rmtree(extract_dir)
     os.makedirs(extract_dir)
     
-    with zipfile.ZipFile(apk_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_dir)
+    with zipfile.ZipFile(apk_path, 'r') as z:
+        z.extractall(extract_dir)
         
-    files_to_patch = []
-    
-    # Logic for common Bundle formats (APKM, XAPK)
-    # usually: base.apk + split_config.arch.apk + split_config.dpi.apk
-    
-    for root, dirs, filenames in os.walk(extract_dir):
+    # Search for apks
+    files = []
+    for root, _, filenames in os.walk(extract_dir):
         for f in filenames:
             if not f.endswith(".apk"): continue
+            full_path = os.path.join(root, f)
             
-            # Filter logic
-            # We WANT: base.apk, arm64_v8a, English language (or no language)
-            # We HATE: x86, armeabi-v7a (if we have arm64), specific dpi if we want universal (but dpi splits are usually needed)
+            # Logic: We need base + arm64
+            # We reject x86
             
-            if "x86" in f or "armeabi_v7a" in f:
-                continue
-                
-            # If we see arm64, we take it.
-            # If we see base, we take it.
-            files_to_patch.append(os.path.join(root, f))
+            if "x86" in f: continue
             
-    if not files_to_patch:
-        error("No suitable APKs found in bundle.")
-        
-    log(f"Selected split files: {files_to_patch}")
-    return files_to_patch
+            # Usually keep base.apk, and anything with arm64
+            # Or if it's a split config, keep density splits (xhdpi etc) if unsure, 
+            # but usually revanced needs base + architecture.
+            files.append(full_path)
+            
+    log(f"Files to patch: {files}")
+    return files
+
+# --- Main ---
 
 def main():
     package_name = os.environ.get("PACKAGE_NAME")
@@ -330,60 +343,48 @@ def main():
     manual_version = os.environ.get("VERSION", "auto")
     
     if not package_name or not app_name:
-        error("PACKAGE_NAME or APP_NAME env vars missing")
-
-    # 1. Setup Tools
+        error("Missing env vars")
+        
     cli_path, patches_rvp_path = fetch_revanced_tools()
     
-    # 2. Determine Version
+    # Determine Version
     target_version = get_compatible_version(package_name, cli_path, patches_rvp_path, manual_version)
+    
     if not target_version:
-        error("Could not determine target version.")
+        error("Could not determine version and fallback failed.")
         
-    # 3. Download
-    # Try APKMirror first as it's the "Gold Standard" for specific versions
+    # Download
     os.makedirs("downloads", exist_ok=True)
-    raw_apk_path = scrape_apkmirror_full(app_name, target_version)
+    apk_path = scrape_apkmirror(app_name, target_version)
     
-    if not raw_apk_path:
-        log("APKMirror failed. Trying APKPure fallback (less reliable for specific versions)...")
-        # Placeholder for APKPure logic if you want to keep the old simple one as backup
-        # raw_apk_path = scrape_apkpure(...)
-        pass
-
-    if not raw_apk_path:
-        error(f"Could not download APK for {app_name} v{target_version}")
+    if not apk_path:
+        # Fallback to APKPure logic if desired, or fail
+        error("Download failed from APKMirror")
         
-    # 4. Prepare inputs (Handle Splits)
-    input_files = process_apk(raw_apk_path)
+    # Process
+    input_files = process_apk(apk_path)
     
-    # 5. Patch
-    output_apk = f"build/{app_name.replace(' ', '-')}-ReVanced-v{target_version}.apk"
+    # Patch
+    output_apk = f"build/{app_name.replace(' ', '')}-ReVanced-v{target_version}.apk"
     os.makedirs("build", exist_ok=True)
     
-    # Command construction
     cmd = [
         "java", "-jar", cli_path,
         "patch",
         "-p", patches_rvp_path,
         "-o", output_apk,
     ]
-    
-    # For split APKs, the CLI accepts multiple input files directly
-    # java -jar cli.jar patch -p patches.rvp -o out.apk base.apk split1.apk split2.apk
     cmd.extend(input_files)
     
-    log(f"Running Patcher: {' '.join(cmd)}")
+    log(f"Running Patcher...")
     try:
         subprocess.run(cmd, check=True)
-        log(f"Patching successful! Output: {output_apk}")
-        
+        log(f"Success: {output_apk}")
         with open(os.environ['GITHUB_ENV'], 'a') as f:
             f.write(f"PATCHED_APK={output_apk}\n")
             f.write(f"APP_VERSION={target_version}\n")
-            
-    except subprocess.CalledProcessError as e:
-        error(f"Patching failed: {e}")
+    except subprocess.CalledProcessError:
+        error("Patching failed")
 
 if __name__ == "__main__":
     main()
