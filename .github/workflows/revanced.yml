@@ -47,6 +47,7 @@ jobs:
           APPS_LIST: ${{ inputs.apps_list }}
           VERSION: ${{ inputs.version_override }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: python scripts/build_from_repo.py
 
       - name: Sign & Align APKs
